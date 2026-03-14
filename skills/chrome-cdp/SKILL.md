@@ -1,16 +1,28 @@
 ---
 name: chrome-cdp
-description: Interact with local Chrome browser session (only on explicit user approval after being asked to inspect, debug, or interact with a page open in Chrome). Master daemon architecture means Chrome's Allow popup only fires once per session.
+description: Interact with local Chromium browser sessions (Chrome, Dia, Brave, Edge, Arc) via CDP - list tabs, take screenshots, evaluate JS, click elements, navigate pages. Supports multiple browsers simultaneously with --browser and --port flags. Master daemon architecture means Chrome's Allow popup only fires once per session.
 ---
 
 # Chrome CDP
 
-Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no Puppeteer, works with 100+ tabs, instant connection.
+Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no Puppeteer, works with 100+ tabs, instant connection. Supports multiple Chromium-based browsers simultaneously.
 
 ## Prerequisites
 
-- Chrome with remote debugging enabled: open `chrome://inspect/#remote-debugging` and toggle the switch
+- A Chromium-based browser with remote debugging enabled
 - Node.js 22+ (uses built-in WebSocket)
+
+### Enabling remote debugging per browser
+
+| Browser | How to enable | Default port |
+|---------|--------------|--------------|
+| **Chrome** | Toggle at `chrome://inspect/#remote-debugging` (one-time Allow popup) | 9222 |
+| **Dia** | Launch with `--remote-debugging-port=9223` (use "Dia Debug" app or `dia` alias) | 9223 |
+| **Brave** | Launch with `--remote-debugging-port=9224` | 9224 |
+| **Edge** | Launch with `--remote-debugging-port=9225` | 9225 |
+| **Arc** | Launch with `--remote-debugging-port=9227` | 9227 |
+
+**Chrome 146+ note:** `--remote-debugging-port` requires `--user-data-dir` (blank profile). For your real profile, use the `chrome://inspect` toggle instead. Other browsers work fine with the launch flag.
 
 ## Architecture
 
@@ -20,6 +32,29 @@ A **master daemon** per browser port holds a single WebSocket connection and mul
 - Daemon auto-exits after 20 min idle
 - Socket path: `/tmp/cdp-master-<port>.sock`
 
+## Selecting a browser
+
+```bash
+# Target by port directly (recommended)
+scripts/cdp.mjs --port 9222 list    # Chrome
+scripts/cdp.mjs --port 9223 list    # Dia
+
+# Target by browser name (reads DevToolsActivePort file)
+scripts/cdp.mjs --browser chrome list
+scripts/cdp.mjs --browser dia list
+
+# Session persistence (single-agent use only)
+scripts/cdp.mjs use 9223            # Set Dia as active
+scripts/cdp.mjs list                # Now targets Dia automatically
+scripts/cdp.mjs use auto            # Clear session
+
+# Environment variables
+CDP_BROWSER=dia scripts/cdp.mjs list
+CDP_PORT=9223 scripts/cdp.mjs list
+```
+
+**Multiple agents:** Use `--port` flags directly instead of `use` — the session file is shared.
+
 ## Commands
 
 All commands use `scripts/cdp.mjs`. The `<target>` is a **unique** targetId prefix from `list`; copy the full prefix shown in the `list` output (for example `6BE827FA`). The CLI rejects ambiguous prefixes.
@@ -28,6 +63,7 @@ All commands use `scripts/cdp.mjs`. The `<target>` is a **unique** targetId pref
 
 ```bash
 scripts/cdp.mjs list
+scripts/cdp.mjs --port 9223 list            # specific browser
 ```
 
 ### Open a new tab
@@ -87,16 +123,7 @@ CSS px = screenshot image px / DPR
 - Prefer `snap --compact` over `html` for page structure.
 - Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
 - Chrome shows an "Allow debugging" modal once when the master daemon starts. Subsequent commands reuse the connection — no more popups.
+- Dia and other browsers launched with `--remote-debugging-port` never show the popup.
 - Only **loaded** tabs appear in `list`. Suspended/discarded tabs are invisible until clicked in the browser.
-
-## Master Daemon IPC
-
-For advanced use / scripting, connect directly to the Unix socket.
-
-Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
-```
-Request:  {"id":<number>, "cmd":"<command>", "targetId":"<optional>", "args":[...]}
-Response: {"id":<number>, "ok":true,  "result":"<string>"}
-       or {"id":<number>, "ok":false, "error":"<message>"}
-```
-Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy, type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods. The socket disappears after 20 min of inactivity.
+- **Multi-browser workflow:** Chrome on 9222 and Dia on 9223 simultaneously. Use `--port` to switch.
+- **Multi-agent safety:** Use `--port` flags (not `use`) when multiple agents run concurrently.

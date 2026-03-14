@@ -21,32 +21,195 @@ const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const PAGES_CACHE = '/tmp/cdp-pages.json';
+const SESSION_FILE = '/tmp/cdp-session.json';
 
 function masterSockPath(port) { return `/tmp/cdp-master-${port}.sock`; }
 
-function getWsUrl() {
-  const candidates = [
-    resolve(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
-    resolve(homedir(), '.config/google-chrome/DevToolsActivePort'),
-  ];
-  const portFile = candidates.find(path => existsSync(path));
-  if (!portFile) throw new Error(`Could not find DevToolsActivePort file in: ${candidates.join(', ')}`);
-  const lines = readFileSync(portFile, 'utf8').trim().split('\n');
-  return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
+// Browser profile paths keyed by short name.
+const BROWSER_PROFILES = {
+  chrome: {
+    darwin: 'Library/Application Support/Google/Chrome',
+    linux: '.config/google-chrome',
+  },
+  brave: {
+    darwin: 'Library/Application Support/BraveSoftware/Brave-Browser',
+    linux: '.config/BraveSoftware/Brave-Browser',
+  },
+  edge: {
+    darwin: 'Library/Application Support/Microsoft Edge',
+    linux: '.config/microsoft-edge',
+  },
+  chromium: {
+    darwin: 'Library/Application Support/Chromium',
+    linux: '.config/chromium',
+  },
+  arc: {
+    darwin: 'Library/Application Support/Arc/User Data',
+    linux: null,
+  },
+  dia: {
+    darwin: 'Library/Application Support/Dia/User Data',
+    linux: null,
+  },
+};
+
+const platform = process.platform === 'darwin' ? 'darwin' : 'linux';
+
+function getBrowserCandidates(browserName) {
+  if (browserName) {
+    const key = browserName.toLowerCase();
+    const profile = BROWSER_PROFILES[key];
+    if (!profile) throw new Error(`Unknown browser "${browserName}". Known: ${Object.keys(BROWSER_PROFILES).join(', ')}`);
+    const dir = profile[platform];
+    if (!dir) throw new Error(`Browser "${browserName}" is not supported on ${platform}`);
+    return [resolve(homedir(), dir, 'DevToolsActivePort')];
+  }
+  // Auto-discover: try all browsers
+  return Object.values(BROWSER_PROFILES)
+    .map(p => p[platform])
+    .filter(Boolean)
+    .map(dir => resolve(homedir(), dir, 'DevToolsActivePort'));
 }
 
-// Extract port number from DevToolsActivePort file without probing the network.
-function resolvePort() {
-  const candidates = [
-    resolve(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
-    resolve(homedir(), '.config/google-chrome/DevToolsActivePort'),
-  ];
+// Parsed from argv in main(), set globally for getWsUrl().
+// Priority: CLI flags > env vars > saved session
+let gBrowser = process.env.CDP_BROWSER || null;
+let gPort = process.env.CDP_PORT || null;
+
+function loadSession() {
+  try {
+    const data = JSON.parse(readFileSync(SESSION_FILE, 'utf8'));
+    if (!gBrowser && !gPort) {
+      if (data.browser) gBrowser = data.browser;
+      if (data.port) gPort = data.port;
+    }
+  } catch {}
+}
+
+function saveSession(browser, port) {
+  const data = {};
+  if (browser) data.browser = browser;
+  if (port) data.port = port;
+  writeFileSync(SESSION_FILE, JSON.stringify(data));
+}
+
+function clearSession() {
+  try { unlinkSync(SESSION_FILE); } catch {}
+}
+
+// Discover the WebSocket URL by querying the HTTP endpoint on a given port.
+async function discoverWsUrl(port) {
+  const url = `http://127.0.0.1:${port}/json/version`;
+  try {
+    const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data.webSocketDebuggerUrl || null;
+  } catch { return null; }
+}
+
+// Check if a port is actually listening by attempting a TCP connection.
+async function isPortOpen(port) {
+  const { createConnection } = await import('net');
+  return new Promise((resolve) => {
+    const sock = createConnection({ host: '127.0.0.1', port }, () => {
+      sock.destroy();
+      resolve(true);
+    });
+    sock.on('error', () => resolve(false));
+    sock.setTimeout(2000, () => { sock.destroy(); resolve(false); });
+  });
+}
+
+async function getWsUrl() {
+  // Direct port override
+  if (gPort) {
+    // Try HTTP discovery first (works for Dia, Brave, etc.)
+    const wsUrl = await discoverWsUrl(gPort);
+    if (wsUrl) return wsUrl;
+    // Chrome's chrome://inspect toggle doesn't expose HTTP endpoints,
+    // but the WebSocket works directly. Fall back to generic URL.
+    if (await isPortOpen(gPort)) {
+      return `ws://127.0.0.1:${gPort}/devtools/browser`;
+    }
+    throw new Error(`No CDP server responding on port ${gPort}`);
+  }
+
+  const candidates = getBrowserCandidates(gBrowser);
+  const portFile = candidates.find(path => existsSync(path));
+  if (!portFile) {
+    const tried = candidates.join('\n  ');
+    const hint = gBrowser
+      ? `Is ${gBrowser} running with remote debugging enabled?`
+      : 'Is any Chromium browser running with remote debugging enabled?';
+    throw new Error(`Could not find DevToolsActivePort file.\n  Tried:\n  ${tried}\n  ${hint}\n  Tip: use --browser <name> or CDP_BROWSER env to target a specific browser (${Object.keys(BROWSER_PROFILES).join(', ')})`);
+  }
+  const lines = readFileSync(portFile, 'utf8').trim().split('\n');
+  const filePort = lines[0];
+  const filePath = lines[1];
+
+  // Try HTTP discovery first (gets the fresh WS URL even if file is stale)
+  const wsUrl = await discoverWsUrl(filePort);
+  if (wsUrl) return wsUrl;
+
+  // HTTP failed — port might still be open (Chrome's toggle doesn't expose HTTP)
+  if (await isPortOpen(filePort)) {
+    return `ws://127.0.0.1:${filePort}${filePath}`;
+  }
+
+  // File is stale — try common debug ports as fallback
+  if (gBrowser) {
+    const browserKey = gBrowser.toLowerCase();
+    const defaultPorts = { chrome: 9222, dia: 9223, brave: 9224, edge: 9225, chromium: 9226, arc: 9227 };
+    const fallbackPort = defaultPorts[browserKey];
+    if (fallbackPort && fallbackPort !== parseInt(filePort)) {
+      const fallbackUrl = await discoverWsUrl(fallbackPort);
+      if (fallbackUrl) {
+        process.stderr.write(`Note: DevToolsActivePort was stale (port ${filePort}), found ${gBrowser} on port ${fallbackPort}\n`);
+        return fallbackUrl;
+      }
+      if (await isPortOpen(fallbackPort)) {
+        process.stderr.write(`Note: DevToolsActivePort was stale (port ${filePort}), found ${gBrowser} on port ${fallbackPort}\n`);
+        return `ws://127.0.0.1:${fallbackPort}/devtools/browser`;
+      }
+    }
+  }
+
+  // Last resort: use the file as-is
+  return `ws://127.0.0.1:${filePort}${filePath}`;
+}
+
+// Extract port number from a ws:// URL
+function extractPort(wsUrl) {
+  const m = wsUrl.match(/:(\d+)\//);
+  return m ? m[1] : '9222';
+}
+
+// Resolve the canonical port for the master daemon identity.
+// IMPORTANT: Avoid calling getWsUrl() here — it probes the port via TCP,
+// which Chrome treats as a new debug connection (triggering Allow popup).
+// Instead, read the port from the DevToolsActivePort file without connecting.
+async function resolvePort() {
+  if (gPort) return String(gPort);
+
+  // Try to read port from DevToolsActivePort file (no network connection needed)
+  const candidates = getBrowserCandidates(gBrowser);
   const portFile = candidates.find(path => existsSync(path));
   if (portFile) {
     const lines = readFileSync(portFile, 'utf8').trim().split('\n');
     return lines[0];
   }
-  return '9222';
+
+  // Fallback to known defaults
+  if (gBrowser) {
+    const defaultPorts = { chrome: '9222', dia: '9223', brave: '9224', edge: '9225', chromium: '9226', arc: '9227' };
+    const key = gBrowser.toLowerCase();
+    if (defaultPorts[key]) return defaultPorts[key];
+  }
+
+  // Last resort: try getWsUrl (will probe)
+  const wsUrl = await getWsUrl();
+  return extractPort(wsUrl);
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -462,7 +625,7 @@ async function runMasterDaemon(port) {
 
   const cdp = new CDP();
   try {
-    await cdp.connect(getWsUrl());
+    await cdp.connect(await getWsUrl());
   } catch (e) {
     process.stderr.write(`Master daemon: cannot connect to browser: ${e.message}\n`);
     process.exit(1);
@@ -545,11 +708,6 @@ async function runMasterDaemon(port) {
         case 'detach': {
           await detachSession(targetId);
           result = 'Detached';
-          break;
-        }
-        case 'get_default_context': {
-          const { defaultBrowserContextId } = await cdp.send('Target.getBrowserContexts');
-          result = defaultBrowserContextId || '';
           break;
         }
         case 'open': {
@@ -651,8 +809,12 @@ async function getOrStartMasterDaemon(port) {
   // Clean stale socket
   try { unlinkSync(sp); } catch {}
 
-  // Spawn master daemon
-  const child = spawn(process.execPath, [process.argv[1], '_master', port], {
+  // Spawn master daemon — forward browser/port flags
+  const daemonArgs = [process.argv[1]];
+  if (gBrowser) daemonArgs.push('--browser', gBrowser);
+  if (gPort) daemonArgs.push('--port', gPort);
+  daemonArgs.push('_master', port);
+  const child = spawn(process.execPath, daemonArgs, {
     detached: true,
     stdio: 'ignore',
   });
@@ -763,10 +925,21 @@ async function stopDaemons(targetPrefix) {
 
 const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
 
-Usage: cdp <command> [args]
+Usage: cdp [--browser <name>] [--port <number>] <command> [args]
 
+Global flags:
+  --browser <name>   Target a specific browser: chrome, brave, edge, chromium, arc, dia
+                     (env: CDP_BROWSER)
+  --port <number>    Connect to a specific debug port instead of auto-discovering
+                     (env: CDP_PORT)
+
+Commands:
+
+  use <browser|port>                Set active browser for subsequent commands
+                                    e.g. "use dia", "use chrome", "use 9223"
+                                    Use "use auto" to clear and auto-discover
   list                              List open pages (shows unique target prefixes)
-  open  <url>                       Open URL in a new tab
+  open <url>                        Open URL in a new tab
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression
   shot  <target> [file]             Screenshot (default: /tmp/screenshot.png); prints coordinate mapping
@@ -823,7 +996,19 @@ const NEEDS_TARGET = new Set([
 ]);
 
 async function main() {
-  const [cmd, ...args] = process.argv.slice(2);
+  // Extract global flags before command parsing
+  const rawArgs = process.argv.slice(2);
+  const filteredArgs = [];
+  for (let i = 0; i < rawArgs.length; i++) {
+    if (rawArgs[i] === '--browser' && i + 1 < rawArgs.length) {
+      gBrowser = rawArgs[++i];
+    } else if (rawArgs[i] === '--port' && i + 1 < rawArgs.length) {
+      gPort = rawArgs[++i];
+    } else {
+      filteredArgs.push(rawArgs[i]);
+    }
+  }
+  const [cmd, ...args] = filteredArgs;
 
   // Master daemon mode (internal)
   if (cmd === '_master') { await runMasterDaemon(args[0]); return; }
@@ -832,8 +1017,34 @@ async function main() {
     console.log(USAGE); process.exit(0);
   }
 
+  // Use command — set active browser session
+  if (cmd === 'use') {
+    const val = args[0];
+    if (!val || val === 'auto' || val === 'clear') {
+      clearSession();
+      console.log('Session cleared — will auto-discover browser.');
+      return;
+    }
+    if (/^\d+$/.test(val)) {
+      saveSession(null, val);
+      console.log(`Session set to port ${val}. All commands will target this port.`);
+    } else {
+      const key = val.toLowerCase();
+      if (!BROWSER_PROFILES[key]) {
+        console.error(`Unknown browser "${val}". Known: ${Object.keys(BROWSER_PROFILES).join(', ')}`);
+        process.exit(1);
+      }
+      saveSession(key, null);
+      console.log(`Session set to ${key}. All commands will target this browser.`);
+    }
+    return;
+  }
+
+  // Load saved session (only if no CLI flags or env vars set)
+  loadSession();
+
   // Resolve canonical port for master daemon
-  const port = resolvePort();
+  const port = await resolvePort();
 
   // List — route through master daemon
   if (cmd === 'list' || cmd === 'ls') {
