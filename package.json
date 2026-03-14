@@ -1,7 +1,7 @@
 {
-  "name": "pi-chrome-cdp",
-  "version": "1.0.2",
-  "description": "Give your AI agent access to your live Chrome session — works out of the box, connects to tabs you already have open",
+  "name": "pi-chrome-cdp-multi",
+  "version": "2.0.0",
+  "description": "Control Chrome, Dia, Brave, Edge & Arc from your AI agent — multi-browser, multi-profile, master daemon architecture with one-time Allow popup",
   "keywords": [
     "pi-package",
     "pi",
@@ -10,7 +10,13 @@
     "chrome",
     "cdp",
     "browser",
-    "devtools"
+    "devtools",
+    "dia",
+    "brave",
+    "edge",
+    "arc",
+    "multi-browser",
+    "multi-profile"
   ],
   "license": "MIT",
   "files": [
